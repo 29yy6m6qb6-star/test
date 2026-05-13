@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>手書きメモ（iOS9対応）</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#f6f7f9; color:#111; -webkit-text-size-adjust:100%; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Noto Sans JP", Meiryo, sans-serif; }
+    .app { display:flex; flex-direction:column; height:100%; }
+    header { background:#fff; border-bottom:1px solid #e5e7eb; padding:12px 16px; }
+    .title { font-size:16px; font-weight:600; }
+    .content { flex:1 1 auto; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:12px 12px 84px; }
+    .toolbar {
+      position: fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid #e5e7eb;
+      padding:8px; display:flex; align-items:center; gap:8px; z-index:10;
+    }
+    .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    input[type="text"] { font-size:16px; padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; flex:1 1 auto; }
+    button, select { font-size:16px; padding:8px 10px; border-radius:8px; border:1px solid #cbd5e1; background:#fff; }
+    button.primary { background:#2563eb; border-color:#2563eb; color:#fff; }
+    .board {
+      background:#fff; border:1px solid #d1d5db; border-radius:8px; padding:8px;
+    }
+    canvas { width:100%; height:360px; display:block; touch-action:none; background:#fff; border-radius:6px; border:1px solid #e5e7eb; }
+    .list { margin-top:12px; }
+    .item { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:10px; margin-top:10px; }
+    .item img { max-width:100%; height:auto; display:block; }
+    .hint { font-size:12px; color:#6b7280; margin:8px 0 12px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="title">手書きメモ（iOS9対応）</div>
+    </header>
+    <main class="content" id="content">
+      <p class="hint">指やスタイラスで描けるキャンバス。iOS9 Safariを想定した実装です。</p>
+      <div class="board">
+        <canvas id="pad" width="800" height="480" aria-label="handwriting canvas"></canvas>
+      </div>
+      <div class="list" id="list"></div>
+    </main>
+
+    <footer class="toolbar" id="toolbar">
+      <div class="row" style="width:100%;">
+        <input id="title" type="text" placeholder="タイトル（任意）">
+        <select id="color">
+          <option value="#111111">黒</option>
+          <option value="#2563eb">青</option>
+          <option value="#dc2626">赤</option>
+          <option value="#16a34a">緑</option>
+        </select>
+        <select id="size">
+          <option value="2">極細</option>
+          <option value="4" selected>細</option>
+          <option value="8">中</option>
+          <option value="12">太</option>
+        </select>
+        <button id="eraser">消しゴム</button>
+        <button id="clear">全消去</button>
+        <button id="save" class="primary">保存</button>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      // Viewport height fixes for iOS9
+      function setHeights() {
+        var h = window.innerHeight || document.documentElement.clientHeight;
+        document.documentElement.style.height = h + 'px';
+        document.body.style.height = h + 'px';
+      }
+      setHeights();
+      window.addEventListener('resize', function(){ setTimeout(setHeights, 150); });
+      window.addEventListener('orientationchange', function(){ setTimeout(setHeights, 250); });
+
+      var canvas = document.getElementById('pad');
+      var ctx = canvas.getContext('2d');
+      var colorEl = document.getElementById('color');
+      var sizeEl = document.getElementById('size');
+      var eraserEl = document.getElementById('eraser');
+      var clearEl = document.getElementById('clear');
+      var saveEl = document.getElementById('save');
+      var titleEl = document.getElementById('title');
+      var listEl = document.getElementById('list');
+      var toolbar = document.getElementById('toolbar');
+
+      // Simple DPR scaling for crisper strokes on Retina
+      function resizeCanvasCSS() {
+        // Keep internal resolution higher than CSS size
+        var rect = canvas.getBoundingClientRect();
+        var dpr = window.devicePixelRatio || 1;
+        // lock height to current layout height
+        var cssWidth = rect.width;
+        var cssHeight = rect.height;
+        canvas.width = Math.round(cssWidth * dpr);
+        canvas.height = Math.round(cssHeight * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        redrawAll(); // after resize, redraw from history
+      }
+
+      // Drawing state
+      var drawing = false;
+      var last = null;
+      var strokes = []; // [{color,size,points:[{x,y}], erase:false}]
+      var currentStroke = null;
+      var isEraser = false;
+
+      function getPos(e) {
+        var rect = canvas.getBoundingClientRect();
+        var x, y;
+        if (e.touches && e.touches.length) {
+          x = e.touches[0].clientX - rect.left;
+          y = e.touches[0].clientY - rect.top;
+        } else {
+          x = e.clientX - rect.left;
+          y = e.clientY - rect.top;
+        }
+        return { x: x, y: y };
+      }
+
+      function start(e) {
+        e.preventDefault();
+        drawing = true;
+        last = getPos(e);
+        currentStroke = {
+          color: isEraser ? '#ffffff' : colorEl.value,
+          size: parseInt(sizeEl.value, 10),
+          erase: isEraser,
+          points: [last]
+        };
+      }
+
+      function move(e) {
+        if (!drawing) return;
+        var p = getPos(e);
+        drawLine(last, p, currentStroke.color, currentStroke.size, currentStroke.erase);
+        currentStroke.points.push(p);
+        last = p;
+      }
+
+      function end() {
+        if (!drawing) return;
+        drawing = false;
+        strokes.push(currentStroke);
+        currentStroke = null;
+      }
+
+      function drawLine(a, b, color, size, erase) {
+        ctx.save();
+        if (erase) {
+          // Erase by compositing to support existing strokes
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.strokeStyle = 'rgba(0,0,0,1)';
+        } else {
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = color;
+        }
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = size;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function redrawAll() {
+        // clear to white background
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+
+        var i, s, j;
+        for (i = 0; i < strokes.length; i++) {
+          s = strokes[i];
+          for (j = 1; j < s.points.length; j++) {
+            drawLine(s.points[j-1], s.points[j], s.color, s.size, s.erase);
+          }
+        }
+      }
+
+      // Bind events (pointer events not fully supported on iOS9)
+      canvas.addEventListener('touchstart', start, false);
+      canvas.addEventListener('touchmove', move, false);
+      canvas.addEventListener('touchend', end, false);
+      canvas.addEventListener('mousedown', start, false);
+      canvas.addEventListener('mousemove', move, false);
+      canvas.addEventListener('mouseup', end, false);
+      canvas.addEventListener('mouseleave', end, false);
+
+      // Prevent scroll while drawing
+      canvas.addEventListener('touchmove', function(e){ e.preventDefault(); }, { passive: false });
+
+      // Toolbar actions
+      eraserEl.addEventListener('click', function(){
+        isEraser = !isEraser;
+        eraserEl.className = isEraser ? 'primary' : '';
+      });
+      clearEl.addEventListener('click', function(){
+        strokes = [];
+        redrawAll();
+      });
+
+      // Save canvas as PNG, store with title in localStorage, and render below
+      function savePNG() {
+        try {
+          // Generate thumbnail for list
+          var dataUrl = canvas.toDataURL('image/png');
+          var item = {
+            title: titleEl.value.trim(),
+            image: dataUrl,
+            ts: Date.now()
+          };
+          persist(item);
+          renderItem(item);
+          titleEl.value = '';
+        } catch (e) {
+          alert('保存に失敗しました: ' + (e && e.message ? e.message : e));
+        }
+      }
+      saveEl.addEventListener('click', savePNG);
+
+      function persist(item) {
+        var list = [];
+        try { list = JSON.parse(localStorage.getItem('hand_notes') || '[]'); } catch (e) {}
+        list.unshift(item);
+        try { localStorage.setItem('hand_notes', JSON.stringify(list)); } catch (e) {}
+      }
+
+      function load() {
+        var list = [];
+        try { list = JSON.parse(localStorage.getItem('hand_notes') || '[]'); } catch (e) {}
+        for (var i = 0; i < list.length; i++) renderItem(list[i]);
+      }
+
+      function renderItem(item) {
+        var box = document.createElement('div');
+        box.className = 'item';
+        var t = item.title ? '<strong>' + esc(item.title) + '</strong><br>' : '';
+        box.innerHTML = t + '<img alt="handwriting image" src="' + item.image + '">';
+        listEl.insertBefore(box, listEl.firstChild);
+      }
+
+      function esc(s) {
+        return s.replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[c]);
+        });
+      }
+
+      // Responsive canvas after layout pass
+      function initSize() {
+        // let CSS height follow available space
+        var content = document.getElementById('content');
+        // ensure toolbar not overlapping
+        resizeCanvasCSS();
+      }
+      window.addEventListener('load', function(){ setTimeout(initSize, 50); });
+      window.addEventListener('resize', function(){ setTimeout(resizeCanvasCSS, 100); });
+      window.addEventListener('orientationchange', function(){ setTimeout(resizeCanvasCSS, 200); });
+
+      // iOS9 fixed toolbar jump mitigation on input focus
+      function focusIn(e) {
+        if (e.target === titleEl) {
+          toolbar.style.position = 'absolute';
+          toolbar.style.bottom = '0';
+        }
+      }
+      function focusOut(e) {
+        if (e.target === titleEl) {
+          toolbar.style.position = 'fixed';
+          toolbar.style.bottom = '0';
+        }
+      }
+      document.addEventListener('focusin', focusIn);
+      document.addEventListener('focusout', focusOut);
+
+      // Initialize white background so erasing shows white, not transparent
+      redrawAll();
+      load();
+    })();
+  </script>
+</body>
+</html>
